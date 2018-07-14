@@ -4,9 +4,10 @@ version = "0.1.0"
 authors = ["Ryan Bluth <ryanbluth93@gmail.com>"]
 
 [dependencies]
-term-table = "0.1.4"
+term-table = "0.1.5"
 serde = "1.0.68"
 serde_json = "1.0.22"
 serde_derive = "1.0.68"
 clap = "2.32.0"
 alphavantage = "0.2.0"
+ansi_term = "0.11"

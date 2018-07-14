@@ -11,18 +11,23 @@ extern crate term_table;
 
 extern crate alphavantage;
 
+extern crate ansi_term;
+
 use term_table::cell::{Alignment, Cell};
 use term_table::row::Row;
 use term_table::Table;
 
 use std::collections::HashMap;
+use std::fmt::{Formatter, Debug};
 use std::fs::{File, OpenOptions};
-use std::io::prelude::*;
 use std::path::PathBuf;
+use std::io::{Read, Write};
 
 use alphavantage::time_series::TimeSeries;
 
 use clap::{App, Arg, SubCommand};
+
+use ansi_term::Colour::{Red, Green};
 
 type StockMap = HashMap<String, HashMap<String, Stock>>;
 
@@ -32,13 +37,38 @@ macro_rules! mapStockoErr {
     };
 }
 
-#[derive(Debug)]
 enum StockoError {
     SaveDataError(String),
     ReadDataError(String),
     AlphaVantageError(String),
     InvalidExchange,
+    InvalidShareQuantity { symbol: String, shares: u32 },
 }
+
+impl Debug for StockoError {
+    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+        match *self {
+            StockoError::SaveDataError(ref e) => {
+                write!(f, "Failed to save stocko_data.json. Cause: {}", e)
+            }
+            StockoError::ReadDataError(ref e) => {
+                write!(f, "Failed to read stocko_data.json. Cause: {}", e)
+            }
+            StockoError::AlphaVantageError(ref e) => write!(
+                f,
+                "Error occured when fetching data from AlphaVantage. Cause: {}",
+                e
+            ),
+            StockoError::InvalidExchange => write!(f, "Invalid exchange symbol"),
+            StockoError::InvalidShareQuantity { ref symbol, shares } => write!(
+                f,
+                "You do not have {} shares of {} in your portfolio",
+                shares, symbol
+            ),
+        }
+    }
+}
+
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Currency {
@@ -80,13 +110,37 @@ struct Stock {
     orders: Vec<Order>,
 
     #[serde(skip_serializing, default)]
-    price: f32,
+    price: f64,
+}
+
+impl Stock {
+    fn calculate_order_metrics(&self) -> OrderMetrics {
+        let total_spent = self
+            .orders
+            .iter()
+            .fold(0.0, |acc, x| acc + x.shares as f64 * x.share_price);
+
+        let total_shares = self.orders.iter().fold(0, |acc, x| acc + x.shares);
+        let average_price = total_spent / total_shares as f64;
+
+        return OrderMetrics {
+            total_spent,
+            total_shares,
+            average_price,
+        };
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Order {
-    shares: u32,
-    share_price: f32,
+    shares: i32,
+    share_price: f64,
+}
+
+struct OrderMetrics {
+    total_spent: f64,
+    total_shares: i32,
+    average_price: f64,
 }
 
 fn main() -> Result<(), StockoError> {
@@ -147,6 +201,38 @@ fn main() -> Result<(), StockoError> {
                         .required(true),
                 ),
         )
+        .subcommand(
+            SubCommand::with_name("sell")
+                .alias("s")
+                .about("Remove shares to your portfolio")
+                .arg(
+                    Arg::with_name("exchange")
+                        .short("e")
+                        .help("Exchange Symbol")
+                        .takes_value(true)
+                        .required(false),
+                )
+                .arg(
+                    Arg::with_name("shares")
+                        .short("s")
+                        .help("Number of shares")
+                        .takes_value(true)
+                        .required(true),
+                )
+                .arg(
+                    Arg::with_name("share_price")
+                        .short("p")
+                        .help("Share Price")
+                        .takes_value(true)
+                        .required(true),
+                )
+                .arg(
+                    Arg::with_name("symbol")
+                        .help("Stock Symbol")
+                        .index(1)
+                        .required(true),
+                ),
+        )
         .get_matches();
 
     if matches.subcommand_matches("list").is_some() {
@@ -159,15 +245,23 @@ fn main() -> Result<(), StockoError> {
             symbol.push_str(suffix);
         }
         watch(symbol, exchange_value)?;
-    } else if let Some(sub_matches) = matches.subcommand_matches("buy") {
+    } else if matches.subcommand_matches("buy").is_some()
+        || matches.subcommand_matches("sell").is_some()
+    {
+        let sub_matches = matches
+            .subcommand_matches("buy")
+            .unwrap_or_else(|| matches.subcommand_matches("sell").unwrap());
         let mut symbol = String::from(sub_matches.value_of("symbol").unwrap());
         let exchange_value = sub_matches.value_of("exchange");
         if let Some(exchange_symbol) = sub_matches.value_of("exchange") {
             let suffix = suffix_for_exchange_symbol(exchange_symbol)?;
             symbol.push_str(suffix);
         }
-        let shares = value_t!(sub_matches, "shares", u32).unwrap();
-        let price = value_t!(sub_matches, "share_price", f32).unwrap();
+        let mut shares = value_t!(sub_matches, "shares", i32).unwrap();
+        let price = value_t!(sub_matches, "share_price", f64).unwrap();
+        if matches.subcommand_matches("sell").is_some() {
+            shares *= -1;
+        }
         process_order(symbol, exchange_value, shares, price)?;
     }
     Ok(())
@@ -196,13 +290,13 @@ fn watch(symbol: String, exchange_symbol: Option<&str>) -> Result<(), StockoErro
 fn process_order(
     symbol: String,
     exchange_symbol: Option<&str>,
-    shares: u32,
-    price: f32,
+    shares: i32,
+    price: f64,
 ) -> Result<(), StockoError> {
     let mut collection = load_data()?;
     let mut stocks = collection.get(&String::from("Portfolio")).unwrap().clone();
 
-    if !stocks.contains_key(&symbol) {
+    if shares > 0 && !stocks.contains_key(&symbol) {
         stocks.insert(
             symbol.clone().to_uppercase(),
             Stock {
@@ -212,9 +306,24 @@ fn process_order(
                 ..Default::default()
             },
         );
+    } else {
+        return Err(StockoError::InvalidShareQuantity {
+            symbol: symbol,
+            shares: shares.abs() as u32,
+        });
     }
+
     {
-        let mut stock = stocks.get_mut(&symbol).unwrap();
+        let stock = stocks.get_mut(&symbol).unwrap();
+
+        let total_shares = stock.calculate_order_metrics().total_shares;
+
+        if total_shares < shares {
+            return Err(StockoError::InvalidShareQuantity {
+                symbol: symbol,
+                shares: shares.abs() as u32,
+            });
+        }
 
         let order = Order {
             shares: shares,
@@ -223,9 +332,10 @@ fn process_order(
 
         stock.orders.push(order);
     }
+
     collection.insert("Portfolio".to_string(), stocks);
 
-    save_data(collection);
+    save_data(collection)?;
 
     Ok(())
 }
@@ -236,6 +346,7 @@ fn fetch_symbol_time_series(symbol: &str) -> Result<TimeSeries, StockoError> {
         StockoError::AlphaVantageError,
         client.get_time_series_daily(symbol)
     )?;
+
     return Ok(time_series);
 }
 
@@ -244,11 +355,11 @@ fn list() -> Result<(), StockoError> {
 
     for key in collection.keys() {
         let mut table = Table::new();
-
+        
         if key.eq(&String::from("Portfolio")) {
             table.add_row(Row::new(vec![Cell::new_with_alignment(
                 key.as_str(),
-                4,
+                6,
                 Alignment::Center,
             )]));
 
@@ -256,6 +367,8 @@ fn list() -> Result<(), StockoError> {
                 Cell::new("Symbol", 1),
                 Cell::new("Price", 1),
                 Cell::new("Change", 1),
+                Cell::new("Shares", 1),
+                Cell::new("Book Cost", 1),
                 Cell::new("Total Gain", 1),
             ]));
         } else {
@@ -277,6 +390,7 @@ fn list() -> Result<(), StockoError> {
             let entries = time_series.entries();
             let num_entries = entries.len();
             let mut entry_iter = entries.into_iter();
+
             let (_date_yesterday, entry_yesterday) = entry_iter.nth(num_entries - 2).unwrap();
             let (_date_today, entry_today) = entry_iter.last().unwrap();
 
@@ -285,32 +399,41 @@ fn list() -> Result<(), StockoError> {
                 100.0 * (entry_today.close - entry_yesterday.close) / entry_yesterday.close;
 
             let change = if change_value >= 0.0 {
-                format!("+{:.2} (+{:.2}%)", change_value, change_percentage)
+                Green.paint(format!("+{:.2} (+{:.2}%)", change_value, change_percentage)).to_string()
             } else {
-                format!("{:.2} ({:.2}%)", change_value, change_percentage)
+                Red.paint(format!("{:.2} ({:.2}%)", change_value, change_percentage)).to_string()
             };
 
             if key.eq(&String::from("Portfolio")) {
-                let total_spent = stock
-                    .orders
-                    .iter()
-                    .fold(0.0, |acc, x| acc + x.shares as f32 * x.share_price);
-                let total_shares = stock.orders.iter().fold(0, |acc, x| acc + x.shares);
-                let average_price = total_spent / total_shares as f32;
+                let order_metrics = stock.calculate_order_metrics();
 
                 let overall_gain =
-                    (average_price as f64 - entry_today.close) / average_price as f64;
+                    (order_metrics.average_price - entry_today.close) / order_metrics.average_price;
 
-                    let formatted_gain = if overall_gain >= 0.0 {
-                        format!("+{:.2} (+{:.2}%)", total_spent as f64 * (1.0 + overall_gain), overall_gain * 100.0)
-                    } else {
-                        format!("{:.2} ({:.2}%)",  total_spent as f64 * (1.0 + overall_gain) - total_spent as f64, overall_gain * 100.0)
-                    };
+                let formatted_gain = if overall_gain >= 0.0 {
+                    Green.paint(format!(
+                        "+{:.2} (+{:.2}%)",
+                        order_metrics.total_spent * (1.0 + overall_gain),
+                        overall_gain * 100.0
+                    )).to_string()
+                } else {
+                    Red.paint(format!(
+                        "{:.2} ({:.2}%)",
+                        order_metrics.total_spent * (1.0 + overall_gain)
+                            - order_metrics.total_spent,
+                        overall_gain * 100.0
+                    )).to_string()
+                };
 
                 let row = Row::new(vec![
                     Cell::new(stock.symbol.clone(), 1),
                     Cell::new(entry_today.close, 1),
                     Cell::new(change, 1),
+                    Cell::new(order_metrics.total_shares, 1),
+                    Cell::new(
+                        order_metrics.total_shares as f64 * order_metrics.average_price,
+                        1,
+                    ),
                     Cell::new(formatted_gain, 1),
                 ]);
                 table.add_row(row);
