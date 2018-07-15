@@ -18,18 +18,18 @@ use term_table::row::Row;
 use term_table::Table;
 
 use std::collections::HashMap;
-use std::fmt::{Formatter, Debug};
+use std::fmt::{Debug, Formatter};
 use std::fs::{File, OpenOptions};
-use std::path::PathBuf;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 
 use alphavantage::time_series::TimeSeries;
 
 use clap::{App, Arg, SubCommand};
 
-use ansi_term::Colour::{Red, Green};
+use ansi_term::Colour::{Green, Red};
 
-type StockMap = HashMap<String, HashMap<String, Stock>>;
+//type StockMap = HashMap<String, HashMap<String, Stock>>;
 
 macro_rules! mapStockoErr {
     ($s:expr, $e:expr) => {
@@ -68,7 +68,6 @@ impl Debug for StockoError {
         }
     }
 }
-
 
 #[derive(Debug, Serialize, Deserialize)]
 enum Currency {
@@ -115,8 +114,7 @@ struct Stock {
 
 impl Stock {
     fn calculate_order_metrics(&self) -> OrderMetrics {
-        let total_spent = self
-            .orders
+        let total_spent = self.orders
             .iter()
             .fold(0.0, |acc, x| acc + x.shares as f64 * x.share_price);
 
@@ -141,6 +139,126 @@ struct OrderMetrics {
     total_spent: f64,
     total_shares: i32,
     average_price: f64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StockCollections {
+    portfolio: HashMap<String, Stock>,
+    watchlist: HashMap<String, Stock>,
+    archive: HashMap<String, Stock>,
+}
+
+struct StockMetrics {
+    change: f64,
+    change_percentage: f64,
+    close_today: f64,
+    close_yesterday: f64,
+}
+
+impl StockCollections {
+    fn new() -> StockCollections {
+        return StockCollections {
+            portfolio: HashMap::new(),
+            watchlist: HashMap::new(),
+            archive: HashMap::new(),
+        };
+    }
+
+    fn print_watch_list(&self) -> Result<(), StockoError> {
+        let mut table = Table::new();
+
+        table.add_row(Row::new(vec![Cell::new_with_alignment(
+            "Watch List",
+            3,
+            Alignment::Center,
+        )]));
+
+        table.add_row(Row::new(vec![
+            Cell::new("Symbol", 1),
+            Cell::new("Price", 1),
+            Cell::new("Change", 1),
+        ]));
+
+        for stock in self.watchlist.values() {
+            let time_series = fetch_symbol_time_series(&stock.symbol)?;
+            let metrics = calculate_stock_metrics(time_series);
+
+            let change = generate_change_string(&metrics);
+
+            let row = Row::new(vec![
+                Cell::new(stock.symbol.clone(), 1),
+                Cell::new(metrics.close_today, 1),
+                Cell::new(change, 1),
+            ]);
+            table.add_row(row);
+        }
+
+        println!("{}", table.as_string());
+
+        Ok(())
+    }
+
+    fn print_portfolio(&self) -> Result<(), StockoError> {
+        let mut table = Table::new();
+
+        table.add_row(Row::new(vec![Cell::new_with_alignment(
+            "Portfolio",
+            6,
+            Alignment::Center,
+        )]));
+
+        table.add_row(Row::new(vec![
+            Cell::new("Symbol", 1),
+            Cell::new("Price", 1),
+            Cell::new("Change", 1),
+            Cell::new("Shares", 1),
+            Cell::new("Book Cost", 1),
+            Cell::new("Total Gain", 1),
+        ]));
+
+        for stock in self.portfolio.values() {
+            let time_series = fetch_symbol_time_series(&stock.symbol)?;
+            let order_metrics = stock.calculate_order_metrics();
+            let metrics = calculate_stock_metrics(time_series);
+            let change = generate_change_string(&metrics);
+
+            let overall_gain =
+                (metrics.close_today - order_metrics.average_price) / order_metrics.average_price;
+
+            let formatted_gain = if overall_gain >= 0.0 {
+                Green
+                    .paint(format!(
+                        "+{:.2} (+{:.2}%)",
+                        order_metrics.total_spent * overall_gain,
+                        overall_gain * 100.0
+                    ))
+                    .to_string()
+            } else {
+                Red.paint(format!(
+                    "{:.2} ({:.2}%)",
+                    order_metrics.total_spent * (1.0 + overall_gain) - order_metrics.total_spent,
+                    overall_gain * 100.0
+                )).to_string()
+            };
+
+            let row = Row::new(vec![
+                Cell::new(stock.symbol.clone(), 1),
+                Cell::new(metrics.close_today, 1),
+                Cell::new(change, 1),
+                Cell::new(order_metrics.total_shares, 1),
+                Cell::new(
+                    order_metrics.total_shares as f64 * order_metrics.average_price,
+                    1,
+                ),
+                Cell::new(formatted_gain, 1),
+            ]);
+            table.add_row(row);
+        }
+
+        println!("{}", table.as_string());
+        
+        Ok(())
+    }
 }
 
 fn main() -> Result<(), StockoError> {
@@ -268,7 +386,7 @@ fn main() -> Result<(), StockoError> {
 }
 
 fn watch(symbol: String, exchange_symbol: Option<&str>) -> Result<(), StockoError> {
-    let mut collection = load_data()?;
+    let mut collections = load_data()?;
     // Run a fetch to make sure things are working
     fetch_symbol_time_series(symbol.as_str())?;
     let stock = Stock {
@@ -277,13 +395,11 @@ fn watch(symbol: String, exchange_symbol: Option<&str>) -> Result<(), StockoErro
         orders: Vec::new(),
         ..Default::default()
     };
-    let key = String::from("Watch List");
 
-    collection
-        .get_mut(&key)
-        .unwrap()
+    collections
+        .watchlist
         .insert(symbol.clone().to_uppercase(), stock);
-    save_data(collection)?;
+    save_data(collections)?;
     Ok(())
 }
 
@@ -294,31 +410,30 @@ fn process_order(
     price: f64,
 ) -> Result<(), StockoError> {
     let mut collection = load_data()?;
-    let mut stocks = collection.get(&String::from("Portfolio")).unwrap().clone();
-
-    if shares > 0 && !stocks.contains_key(&symbol) {
-        stocks.insert(
-            symbol.clone().to_uppercase(),
-            Stock {
-                symbol: symbol.clone().to_uppercase(),
-                exchange: Exchange::from_symbol(exchange_symbol)?,
-                orders: Vec::new(),
-                ..Default::default()
-            },
-        );
-    } else {
-        return Err(StockoError::InvalidShareQuantity {
-            symbol: symbol,
-            shares: shares.abs() as u32,
-        });
+    if !collection.portfolio.contains_key(&symbol) {
+        if shares > 0 {
+            collection.portfolio.insert(
+                symbol.clone().to_uppercase(),
+                Stock {
+                    symbol: symbol.clone().to_uppercase(),
+                    exchange: Exchange::from_symbol(exchange_symbol)?,
+                    orders: Vec::new(),
+                    ..Default::default()
+                },
+            );
+        } else {
+            return Err(StockoError::InvalidShareQuantity {
+                symbol: symbol,
+                shares: shares.abs() as u32,
+            });
+        }
     }
-
     {
-        let stock = stocks.get_mut(&symbol).unwrap();
+        let stock = collection.portfolio.get_mut(&symbol).unwrap();
 
         let total_shares = stock.calculate_order_metrics().total_shares;
 
-        if total_shares < shares {
+        if shares < 0 && total_shares < shares.abs() {
             return Err(StockoError::InvalidShareQuantity {
                 symbol: symbol,
                 shares: shares.abs() as u32,
@@ -332,8 +447,6 @@ fn process_order(
 
         stock.orders.push(order);
     }
-
-    collection.insert("Portfolio".to_string(), stocks);
 
     save_data(collection)?;
 
@@ -352,107 +465,12 @@ fn fetch_symbol_time_series(symbol: &str) -> Result<TimeSeries, StockoError> {
 
 fn list() -> Result<(), StockoError> {
     let collection = load_data()?;
-
-    for key in collection.keys() {
-        let mut table = Table::new();
-        
-        if key.eq(&String::from("Portfolio")) {
-            table.add_row(Row::new(vec![Cell::new_with_alignment(
-                key.as_str(),
-                6,
-                Alignment::Center,
-            )]));
-
-            table.add_row(Row::new(vec![
-                Cell::new("Symbol", 1),
-                Cell::new("Price", 1),
-                Cell::new("Change", 1),
-                Cell::new("Shares", 1),
-                Cell::new("Book Cost", 1),
-                Cell::new("Total Gain", 1),
-            ]));
-        } else {
-            table.add_row(Row::new(vec![Cell::new_with_alignment(
-                key.as_str(),
-                3,
-                Alignment::Center,
-            )]));
-
-            table.add_row(Row::new(vec![
-                Cell::new("Symbol", 1),
-                Cell::new("Price", 1),
-                Cell::new("Change", 1),
-            ]));
-        }
-
-        for stock in collection.get(key).unwrap().values() {
-            let time_series = fetch_symbol_time_series(&stock.symbol)?;
-            let entries = time_series.entries();
-            let num_entries = entries.len();
-            let mut entry_iter = entries.into_iter();
-
-            let (_date_yesterday, entry_yesterday) = entry_iter.nth(num_entries - 2).unwrap();
-            let (_date_today, entry_today) = entry_iter.last().unwrap();
-
-            let change_value = entry_today.close - entry_yesterday.close;
-            let change_percentage =
-                100.0 * (entry_today.close - entry_yesterday.close) / entry_yesterday.close;
-
-            let change = if change_value >= 0.0 {
-                Green.paint(format!("+{:.2} (+{:.2}%)", change_value, change_percentage)).to_string()
-            } else {
-                Red.paint(format!("{:.2} ({:.2}%)", change_value, change_percentage)).to_string()
-            };
-
-            if key.eq(&String::from("Portfolio")) {
-                let order_metrics = stock.calculate_order_metrics();
-
-                let overall_gain =
-                    (order_metrics.average_price - entry_today.close) / order_metrics.average_price;
-
-                let formatted_gain = if overall_gain >= 0.0 {
-                    Green.paint(format!(
-                        "+{:.2} (+{:.2}%)",
-                        order_metrics.total_spent * (1.0 + overall_gain),
-                        overall_gain * 100.0
-                    )).to_string()
-                } else {
-                    Red.paint(format!(
-                        "{:.2} ({:.2}%)",
-                        order_metrics.total_spent * (1.0 + overall_gain)
-                            - order_metrics.total_spent,
-                        overall_gain * 100.0
-                    )).to_string()
-                };
-
-                let row = Row::new(vec![
-                    Cell::new(stock.symbol.clone(), 1),
-                    Cell::new(entry_today.close, 1),
-                    Cell::new(change, 1),
-                    Cell::new(order_metrics.total_shares, 1),
-                    Cell::new(
-                        order_metrics.total_shares as f64 * order_metrics.average_price,
-                        1,
-                    ),
-                    Cell::new(formatted_gain, 1),
-                ]);
-                table.add_row(row);
-            } else {
-                let row = Row::new(vec![
-                    Cell::new(stock.symbol.clone(), 1),
-                    Cell::new(entry_today.close, 1),
-                    Cell::new(change, 1),
-                ]);
-                table.add_row(row);
-            }
-        }
-        println!("{}", table.as_string());
-    }
-
+    collection.print_portfolio()?;
+    collection.print_watch_list()?;
     Ok(())
 }
 
-fn save_data(collections: StockMap) -> Result<(), StockoError> {
+fn save_data(collections: StockCollections) -> Result<(), StockoError> {
     let mut file = mapStockoErr!(
         StockoError::SaveDataError,
         OpenOptions::new()
@@ -468,11 +486,11 @@ fn save_data(collections: StockMap) -> Result<(), StockoError> {
     return mapStockoErr!(StockoError::SaveDataError, file.write_all(&*json));
 }
 
-fn load_data() -> Result<StockMap, StockoError> {
+fn load_data() -> Result<StockCollections, StockoError> {
     let path = get_data_file_path();
 
     if !path.exists() {
-        return Ok(gen_default_stock_collections());
+        return Ok(StockCollections::new());
     }
 
     let mut file = mapStockoErr!(StockoError::ReadDataError, File::open(path))?;
@@ -482,7 +500,7 @@ fn load_data() -> Result<StockMap, StockoError> {
 
     return mapStockoErr!(
         StockoError::ReadDataError,
-        serde_json::from_str::<StockMap>(buf.as_str())
+        serde_json::from_str::<StockCollections>(buf.as_str())
     );
 }
 
@@ -493,13 +511,6 @@ fn get_data_file_path() -> PathBuf {
     return exe_path;
 }
 
-fn gen_default_stock_collections() -> StockMap {
-    let mut res = StockMap::new();
-    res.insert(String::from("Watch List"), HashMap::new());
-    res.insert(String::from("Portfolio"), HashMap::new());
-    return res;
-}
-
 fn suffix_for_exchange_symbol(exchange_symbol: &str) -> Result<&'static str, StockoError> {
     match exchange_symbol.to_lowercase().as_ref() {
         "tsx" => Ok(".TO"),
@@ -507,4 +518,40 @@ fn suffix_for_exchange_symbol(exchange_symbol: &str) -> Result<&'static str, Sto
         "nsye" => Ok(""),
         _ => Err(StockoError::InvalidExchange),
     }
+}
+
+fn calculate_stock_metrics(time_series: TimeSeries) -> StockMetrics {
+    let entries = time_series.entries();
+    let num_entries = entries.len();
+    let mut entry_iter = entries.into_iter();
+
+    let (_date_yesterday, entry_yesterday) = entry_iter.nth(num_entries - 2).unwrap();
+    let (_date_today, entry_today) = entry_iter.last().unwrap();
+
+    let change_value = entry_today.close - entry_yesterday.close;
+    let change_percentage =
+        100.0 * (entry_today.close - entry_yesterday.close) / entry_yesterday.close;
+
+    return StockMetrics {
+        change_percentage: change_percentage,
+        change: change_value,
+        close_today: entry_today.close,
+        close_yesterday: entry_yesterday.close,
+    };
+}
+
+fn generate_change_string(metrics: &StockMetrics) -> String {
+    return if metrics.change >= 0.0 {
+        Green
+            .paint(format!(
+                "+{:.2} (+{:.2}%)",
+                metrics.change, metrics.change_percentage
+            ))
+            .to_string()
+    } else {
+        Red.paint(format!(
+            "{:.2} ({:.2}%)",
+            metrics.change, metrics.change_percentage
+        )).to_string()
+    };
 }
