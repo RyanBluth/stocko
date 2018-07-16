@@ -29,8 +29,6 @@ use clap::{App, Arg, SubCommand};
 
 use ansi_term::Colour::{Green, Red};
 
-//type StockMap = HashMap<String, HashMap<String, Stock>>;
-
 macro_rules! mapStockoErr {
     ($s:expr, $e:expr) => {
         $e.map_err(|e| -> StockoError { $s(e.to_string()) })
@@ -91,7 +89,7 @@ impl Default for Exchange {
 impl Exchange {
     fn from_symbol(symbol: Option<&str>) -> Result<Exchange, StockoError> {
         if let Some(symbol) = symbol {
-            return match symbol {
+            return match symbol.to_lowercase().as_ref() {
                 "tsx" => Ok(Exchange::TSX),
                 "tsxv" => Ok(Exchange::TSXV),
                 "nsye" => Ok(Exchange::NYSE),
@@ -116,15 +114,23 @@ impl Stock {
     fn calculate_order_metrics(&self) -> OrderMetrics {
         let total_spent = self.orders
             .iter()
+            .filter(|x| x.shares > 0)
             .fold(0.0, |acc, x| acc + x.shares as f64 * x.share_price);
 
+        let total_sell = self.orders
+            .iter()
+            .filter(|x| x.shares < 0)
+            .fold(0.0, |acc, x| acc + x.shares.abs() as f64 * x.share_price);
+
         let total_shares = self.orders.iter().fold(0, |acc, x| acc + x.shares);
+
         let average_price = total_spent / total_shares as f64;
 
         return OrderMetrics {
             total_spent,
             total_shares,
             average_price,
+            total_sell,
         };
     }
 }
@@ -139,6 +145,7 @@ struct OrderMetrics {
     total_spent: f64,
     total_shares: i32,
     average_price: f64,
+    total_sell: f64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -256,7 +263,67 @@ impl StockCollections {
         }
 
         println!("{}", table.as_string());
-        
+
+        Ok(())
+    }
+
+    fn print_archive(&self) -> Result<(), StockoError> {
+        let mut table = Table::new();
+
+        table.add_row(Row::new(vec![Cell::new_with_alignment(
+            "Archive",
+            3,
+            Alignment::Center,
+        )]));
+
+        table.add_row(Row::new(vec![
+            Cell::new("Symbol", 1),
+            Cell::new("Orders", 1),
+            Cell::new("Gain", 1),
+        ]));
+
+        let mut total_spent = 0.0;
+        let mut total_sell = 0.0;
+
+        for stock in self.archive.values() {
+            let order_metrics = stock.calculate_order_metrics();
+
+            let gain_percentage =
+                (order_metrics.total_sell - order_metrics.total_spent) / order_metrics.total_spent;
+            let overall_gain = order_metrics.total_sell - order_metrics.total_spent;
+
+            total_spent += order_metrics.total_spent;
+            total_sell += order_metrics.total_sell;
+
+            let formatted_gain = generate_gain_string(overall_gain, gain_percentage);
+
+            let mut orders = String::new();
+
+            for order in &stock.orders {
+                orders += &*format!("{} @ {}\n", order.shares, order.share_price);
+            }
+            orders.pop();
+
+            let row = Row::new(vec![
+                Cell::new(stock.symbol.clone(), 1),
+                Cell::new(orders, 1),
+                Cell::new(formatted_gain, 1),
+            ]);
+            table.add_row(row);
+        }
+
+        let total_gain_percentage = (total_sell - total_spent) / total_spent;
+        let total_gain = total_sell - total_spent;
+
+        let formatted_total_gain = generate_gain_string(total_gain, total_gain_percentage);
+
+        table.add_row(Row::new(vec![
+            Cell::new("Total Gain", 2),
+            Cell::new(formatted_total_gain, 1),
+        ]));
+
+        println!("{}", table.as_string());
+
         Ok(())
     }
 }
@@ -380,7 +447,7 @@ fn main() -> Result<(), StockoError> {
         if matches.subcommand_matches("sell").is_some() {
             shares *= -1;
         }
-        process_order(symbol, exchange_value, shares, price)?;
+        process_order(symbol.to_uppercase(), exchange_value, shares, price)?;
     }
     Ok(())
 }
@@ -411,6 +478,7 @@ fn process_order(
 ) -> Result<(), StockoError> {
     let mut collection = load_data()?;
     if !collection.portfolio.contains_key(&symbol) {
+        println!("{:?}", collection.portfolio);
         if shares > 0 {
             collection.portfolio.insert(
                 symbol.clone().to_uppercase(),
@@ -428,24 +496,32 @@ fn process_order(
             });
         }
     }
-    {
-        let stock = collection.portfolio.get_mut(&symbol).unwrap();
 
-        let total_shares = stock.calculate_order_metrics().total_shares;
+    let mut stock = collection.portfolio.get(&symbol).unwrap().clone();
 
-        if shares < 0 && total_shares < shares.abs() {
-            return Err(StockoError::InvalidShareQuantity {
-                symbol: symbol,
-                shares: shares.abs() as u32,
-            });
-        }
+    let total_shares = stock.calculate_order_metrics().total_shares;
 
-        let order = Order {
-            shares: shares,
-            share_price: price,
-        };
+    println!("{}", total_shares);
 
-        stock.orders.push(order);
+    if shares < 0 && total_shares < shares.abs() {
+        return Err(StockoError::InvalidShareQuantity {
+            symbol: symbol,
+            shares: shares.abs() as u32,
+        });
+    }
+
+    let order = Order {
+        shares: shares,
+        share_price: price,
+    };
+
+    stock.orders.push(order);
+
+    if shares < 0 && total_shares == shares.abs() {
+        collection.portfolio.remove(&symbol);
+        collection.archive.insert(symbol, stock);
+    } else {
+        collection.portfolio.insert(symbol, stock);
     }
 
     save_data(collection)?;
@@ -467,6 +543,7 @@ fn list() -> Result<(), StockoError> {
     let collection = load_data()?;
     collection.print_portfolio()?;
     collection.print_watch_list()?;
+    collection.print_archive()?;
     Ok(())
 }
 
@@ -553,5 +630,16 @@ fn generate_change_string(metrics: &StockMetrics) -> String {
             "{:.2} ({:.2}%)",
             metrics.change, metrics.change_percentage
         )).to_string()
+    };
+}
+
+fn generate_gain_string(gain: f64, gain_percentage: f64) -> String {
+    return if gain >= 0.0 {
+        Green
+            .paint(format!("+{:.2} (+{:.2}%)", gain, gain_percentage * 100.0))
+            .to_string()
+    } else {
+        Red.paint(format!("{:.2} ({:.2}%)", gain, gain_percentage * 100.0))
+            .to_string()
     };
 }
